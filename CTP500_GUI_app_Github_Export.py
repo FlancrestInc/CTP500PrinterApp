@@ -10,6 +10,11 @@ import socket
 import sys
 from time import sleep
 import struct
+import binascii
+import queue
+import threading
+import time
+import select
 
 #Tkinter imports
 import tkinter as tk
@@ -41,19 +46,18 @@ class PrinterConnect: #Starting a PrinterConnect class to keep track of connecti
 
         try: #Starting all the things to do to establish a connection
             self.socket = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM) #Setting up the Bluetooth socket with RFCOMM protocol
+            # Timeout protects against the OS or driver hanging indefinitely.
+            # The CTP500TL can silently stall if a link is flaky, so we cap every blocking call.
+            self.socket.settimeout(5)
             self.socket.connect((mac_address, 1)) #Connection instruction with address and port to use
-
-            print("Getting printer status")
-            status = self.get_printer_status() #Calling the get_printer_status() function and storing it in status variable
-            print(f'Printer status: {status}') #Displaying status variable
 
             self.connected = True #Switching connection status for tracking
             print("Connection established")
+
             return True #Returning status
 
         except Exception as e: #Exception handling in case something goes wrong
             print(f'Connection error: {e}')
-            messagebox.showerror("Connection Error", f'Failed to connect with printer: {e}')
             if self.socket: #If the socket connection is present:
                 self.socket.close() #Closing the connection
                 self.socket = None #Clearing the socket references
@@ -88,13 +92,93 @@ class PrinterConnect: #Starting a PrinterConnect class to keep track of connecti
     def get_printer_status(self):
         if not self.socket:
             raise Exception("Not connected")
-        self.socket.send(b"\x1e\x47\x03") #Hex code for status request
-        return self.socket.recv(38) #Returning status request content
+        try:
+            # Best-effort status request. Never block indefinitely while waiting on recv().
+            self.socket.send(b"\x1e\x47\x03") #Hex code for status request
+            ready, _, _ = select.select([self.socket], [], [], 0.5)
+            if ready:
+                return self.socket.recv(38) #Returning status request content
+        except socket.timeout:
+            pass
+        except Exception as e:
+            print(f"Status query failed: {e}")
+        return b""
 
 
 printer = PrinterConnect() #Creating a printer connection instance here. Having it *outside* of a function lets us run and monitor connection across global scope
 printerWidth = 384  # For CPT500
 #PRINTER COMMUNICATION LOGIC AND SETUP ENDS HERE
+
+#DEBUG/WORKER UTILITIES START HERE
+def format_hex(data):
+    return binascii.hexlify(data).decode("ascii")
+
+def log_debug(debug_enabled, message):
+    if debug_enabled:
+        print(message)
+
+def send_bytes_chunked(soc, data, debug_enabled, chunk_size=512, delay_s=0.01, label="Data"):
+    """
+    Send data in small chunks with tiny sleeps in between.
+    This improves reliability on the CTP500TL by avoiding buffer overrun and
+    gives the OS a chance to flush the Bluetooth stack.
+    """
+    total = len(data)
+    if total == 0:
+        return
+    offset = 0
+    last_time = time.monotonic()
+    while offset < total:
+        chunk = data[offset:offset + chunk_size]
+        soc.send(chunk)
+        now = time.monotonic()
+        delta_ms = (now - last_time) * 1000
+        log_debug(debug_enabled, f"{label} chunk {offset}-{offset + len(chunk)} ({len(chunk)} bytes), {delta_ms:.1f}ms since last chunk")
+        log_debug(debug_enabled, f"{label} bytes: {format_hex(chunk)}")
+        offset += len(chunk)
+        last_time = now
+        if delay_s:
+            sleep(delay_s)
+    log_incoming_bytes(soc, debug_enabled)
+
+def log_incoming_bytes(soc, debug_enabled):
+    if not debug_enabled:
+        return
+    try:
+        ready, _, _ = select.select([soc], [], [], 0)
+        if ready:
+            data = soc.recv(1024)
+            if data:
+                print(f"Incoming bytes: {format_hex(data)}")
+    except Exception as e:
+        print(f"Incoming read failed: {e}")
+
+class BluetoothWorker:
+    def __init__(self, status_callback):
+        self.status_callback = status_callback
+        self.queue = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def enqueue(self, func, *args):
+        self.queue.put((func, args))
+
+    def shutdown(self):
+        self.queue.put(None)
+
+    def _run(self):
+        while True:
+            task = self.queue.get()
+            if task is None:
+                break
+            func, args = task
+            try:
+                func(*args)
+            except Exception as e:
+                self.status_callback(f"Error: {e}")
+            finally:
+                self.queue.task_done()
+#DEBUG/WORKER UTILITIES END HERE
 
 #IMAGE DATA STORAGE STARTS HERE
 current_image = None #Variable to store full resolution image
@@ -161,17 +245,8 @@ def print_from_entry():
     img = create_text(txt) #Turning the text to image
 
     if printer.connected and printer.socket: #Send the text to the printer over the printer.socket (if connected)
-        try:
-            initializePrinter(printer.socket) #Initializing printer
-            sleep(0.5)
-            sendStartPrintSequence(printer.socket) #Starting up print sequence
-            sleep(0.5)
-            printImage(printer.socket, img) #Passing data to print
-            sleep(0.5)
-            sendEndPrintSequence(printer.socket) #Sending end of print sequence
-            #messagebox.showinfo("Success", "Printed successfully.") #Optional success message
-        except Exception as e:
-            messagebox.showerror("Printing error", str(e))
+        debug_enabled = bool(debugModeVar.get())
+        worker.enqueue(run_print_job, img, "Text print", debug_enabled)
     else:
         messagebox.showwarning("Not connected",
                                "Please connect to the printer first.")
@@ -187,26 +262,17 @@ def print_from_image():
                                "Please connect to the printer first.")
         return
 
-    try:
-        print("Initializing printer")
-        initializePrinter(printer.socket)
-        sleep(0.5)
+    debug_enabled = bool(debugModeVar.get())
+    worker.enqueue(run_print_job, current_image, "Image print", debug_enabled)
 
-        print("Starting print sequence")
-        sendStartPrintSequence(printer.socket)
-        sleep(0.5)
-
-        # THIS is where we actually hand the image over
-        print("Printing image")
-        printImage(printer.socket, current_image)
-
-        print("Sending end sequence")
-        sleep(0.5)
-        sendEndPrintSequence(printer.socket)
-
-        messagebox.showinfo("Success", "Image printed successfully.")
-    except Exception as e:
-        messagebox.showerror("Printing error", str(e))
+def print_test_pattern():
+    if not (printer.connected and printer.socket):
+        messagebox.showwarning("Not connected",
+                               "Please connect to the printer first.")
+        return
+    debug_enabled = bool(debugModeVar.get())
+    img = create_test_pattern_image()
+    worker.enqueue(run_print_job, img, "Test pattern", debug_enabled)
 
 
 #IMAGE FILE SECTION STARTS HERE
@@ -285,7 +351,7 @@ def printImage(socket, im):
                                 int(im.size[1] / 256)),
                     im.tobytes()))
 
-    socket.send(buf)
+    return buf
 
 def trimImage(im):
     bg = PIL.Image.new(im.mode, im.size, (255, 255, 255))
@@ -295,18 +361,69 @@ def trimImage(im):
     if bbox:
         return im.crop((bbox[0], bbox[1], bbox[2], bbox[3] + 10))  # Don't cut off the end of the image
 
-def initializePrinter(soc):
-    soc.send(b"\x1b\x40")
+def initializePrinter(soc, debug=False):
+    send_bytes_chunked(soc, b"\x1b\x40", debug, label="Init")
 
-def sendStartPrintSequence(soc):
+def sendStartPrintSequence(soc, debug=False):
     #Check against hex dump
-    soc.send(b"\x1d\x49\xf0\x19")
+    send_bytes_chunked(soc, b"\x1d\x49\xf0\x19", debug, label="Start print")
 
-def sendEndPrintSequence(soc):
+def sendEndPrintSequence(soc, debug=False):
     #Check against hex dump. Missings \x9a?
-    soc.send(b"\x0a\x0a\x0a\x9a")
+    send_bytes_chunked(soc, b"\x0a\x0a\x0a\x9a", debug, label="End print")
 
 #TEXT AND IMAGE INPUT RENDERING AND PRINTING ENDS HERE
+
+def create_test_pattern_image():
+    # Simple, reliable pattern using the same raster pipeline as normal prints.
+    img = PIL.Image.new("1", (printerWidth, 200), 1)
+    draw = PIL.ImageDraw.Draw(img)
+    draw.rectangle((0, 0, printerWidth - 1, 199), outline=0, fill=1)
+    for y in range(0, 200, 16):
+        for x in range(0, printerWidth, 16):
+            if (x // 16 + y // 16) % 2 == 0:
+                draw.rectangle((x, y, x + 15, y + 15), fill=0)
+    draw.text((8, 8), "HELLO", fill=0)
+    return img
+
+def run_print_job(image, job_name, debug_enabled):
+    if not (printer.connected and printer.socket):
+        update_status("Not connected")
+        return
+    try:
+        update_status(f"{job_name}: initializing")
+        initializePrinter(printer.socket, debug_enabled)
+        sleep(0.2)
+
+        update_status(f"{job_name}: starting")
+        sendStartPrintSequence(printer.socket, debug_enabled)
+        sleep(0.2)
+
+        update_status(f"{job_name}: sending image")
+        buf = printImage(printer.socket, image)
+        send_bytes_chunked(printer.socket, buf, debug_enabled, chunk_size=512, delay_s=0.01, label="Print data")
+
+        update_status(f"{job_name}: finishing")
+        sleep(0.2)
+        sendEndPrintSequence(printer.socket, debug_enabled)
+        update_status(f"{job_name}: done")
+    except Exception as e:
+        update_status(f"{job_name} failed: {e}")
+
+def run_connect():
+    update_status("Connecting...")
+    if printer.connect(mac_address):
+        update_status("Connected")
+        print("Getting printer status (best effort)")
+        status = printer.get_printer_status()
+        print(f'Printer status: {status}')
+    else:
+        update_status("Connection failed")
+
+def run_disconnect():
+    update_status("Disconnecting...")
+    printer.disconnect()
+    update_status("Disconnected")
 
 #GUI SETUP STARTS HERE
 
@@ -319,6 +436,15 @@ root.title("CTP500 Printer Control")
 root.configure() #Sets background color of the window. We will tweak this later to be able to select from printer colors and patterns
 root.minsize(520, 600) #Sets min size of the window
 root.geometry("520x600") #Changes original rendering position of the window
+
+#Status + debug controls
+statusVar = tk.StringVar(value="Disconnected")
+debugModeVar = tk.IntVar(value=0)
+
+def update_status(message):
+    root.after(0, lambda: statusVar.set(message))
+
+worker = BluetoothWorker(update_status)
 
 #BLUETOOTH TOOLS SECTION STARTS HERE
 bluetoothFrame = Frame(root,
@@ -333,7 +459,7 @@ bluetoothLabel.pack(fill="x")
 connectButton = tk.Button(
     bluetoothFrame,
     text = "Connect",
-    command=lambda: printer.connect(mac_address),
+    command=lambda: worker.enqueue(run_connect),
     padx = 15,
     pady = 15
 ).pack(
@@ -345,7 +471,7 @@ connectButton = tk.Button(
 disconnectButton = tk.Button(
     bluetoothFrame,
     text = "Disconnect",
-    command=lambda: printer.disconnect(),
+    command=lambda: worker.enqueue(run_disconnect),
     padx = 15,
     pady = 15
 ).pack(
@@ -354,6 +480,22 @@ disconnectButton = tk.Button(
 )
 
 bluetoothFrame.pack() #Rendering bluetoothFrame
+
+debugFrame = Frame(root, padx=5, pady=5)
+debugCheckbox = tk.Checkbutton(
+    debugFrame,
+    text="Debug mode (log bytes/chunks)",
+    variable=debugModeVar
+)
+debugCheckbox.pack(side="left")
+debugFrame.pack(fill="x")
+
+statusFrame = Frame(root, padx=5, pady=5)
+statusLabelTitle = Label(statusFrame, text="Status:")
+statusLabelTitle.pack(side="left")
+statusLabelValue = Label(statusFrame, textvariable=statusVar, anchor="w")
+statusLabelValue.pack(side="left", fill="x", expand=True)
+statusFrame.pack(fill="x")
 #BLUETOOTH TOOLS SECTION ENDS HERE
 
 #TEXT TOOLS SECTION STARTS HERE
@@ -425,11 +567,18 @@ printImageButton = Button(imageFrame,
                           padx=10, pady=15,
                           command=print_from_image)
 printImageButton.pack(fill="x", pady=(5, 0))
+
+printTestButton = Button(imageFrame,
+                         text="Print Test Pattern",
+                         padx=10, pady=15,
+                         command=print_test_pattern)
+printTestButton.pack(fill="x", pady=(5, 0))
 imageFrame.pack(fill="both", expand=True, padx=10, pady=5)
 #IMAGE TOOLS SECTION ENDS HERE
 
 def on_closing(): #Cleanup operations when closing the window
     printer.disconnect() #Disconnecting the printer
+    worker.shutdown()
     root.destroy() #Flushing the UI
 
 root.protocol("WM_DELETE_WINDOW", on_closing) #Final window cleanup on app closing
