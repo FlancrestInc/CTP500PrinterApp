@@ -8,6 +8,8 @@ Shout out to Bitflip, Tsathoggualware, Reid and all the mad lasses and lads whos
 #System imports
 import socket
 import sys
+import os
+import json
 from time import sleep
 import struct
 import binascii
@@ -33,7 +35,23 @@ import PIL.ImageChops
 import PIL.ImageOps
 
 #COMMUNICATION LOGIC STARTS HERE
-mac_address = "00:00:00:00:00:00" #Put in your printer's Bluetooth device address here - you can find it in the app
+SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "ctp500_settings.json")
+
+def load_settings():
+    if not os.path.exists(SETTINGS_PATH):
+        return {}
+    try:
+        with open(SETTINGS_PATH, "r", encoding="utf-8") as settings_file:
+            return json.load(settings_file)
+    except Exception:
+        return {}
+
+def save_settings(settings):
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as settings_file:
+        json.dump(settings, settings_file, indent=2)
+
+settings = load_settings()
+mac_address = settings.get("mac_address", "00:00:00:00:00:00") #Put in your printer's Bluetooth device address here - you can find it in the app
 
 class PrinterConnect: #Starting a PrinterConnect class to keep track of connection status
     def __init__(self):
@@ -139,6 +157,9 @@ printerWidth = 384  # For CPT500
 def format_hex(data):
     return binascii.hexlify(data).decode("ascii")
 
+def format_ascii(data):
+    return "".join(chr(b) if 32 <= b <= 126 else "." for b in data)
+
 def log_debug(debug_enabled, message):
     if debug_enabled:
         print(message)
@@ -219,6 +240,23 @@ def log_diagnostics(message):
         diagnostics_log_widget.after(0, lambda: _append_diag_log(line))
     else:
         print(line.strip())
+
+def log_command_response(name, sent_bytes, response):
+    log_diagnostics(f"{name}: sent {len(sent_bytes)} bytes: {format_hex(sent_bytes)}")
+    if response:
+        log_diagnostics(f"{name}: received {len(response)} bytes: {format_hex(response)}")
+        log_diagnostics(f"{name}: ascii: {format_ascii(response)}")
+    else:
+        log_diagnostics(f"{name}: no response")
+
+mac_address_var = None
+
+def get_current_mac_address():
+    if mac_address_var is not None:
+        candidate = mac_address_var.get().strip()
+        if candidate:
+            return candidate
+    return mac_address
 
 def _append_diag_log(line):
     diagnostics_log_widget.configure(state="normal")
@@ -358,7 +396,11 @@ def run_diagnostics_sequence():
                 needs_connect = True
             root.after(0, lambda: connectButton.config(state="disabled"))
             log_diagnostics("Step A: connecting...")
-            if not printer.connect(mac_address):
+            target_mac = get_current_mac_address()
+            if not target_mac:
+                log_diagnostics("Step A: missing MAC address")
+                return
+            if not printer.connect(target_mac):
                 log_diagnostics("Step A: connection failed")
                 return
             log_diagnostics("Step A: connected")
@@ -641,10 +683,10 @@ def run_print_job(image, job_name, debug_enabled):
     except Exception as e:
         update_status(f"{job_name} failed: {e}")
 
-def run_connect():
+def run_connect(target_mac):
     try:
         update_status("Connecting...")
-        if printer.connect(mac_address):
+        if printer.connect(target_mac):
             update_status("Connected")
             print("Getting printer status (best effort)")
             status = printer.get_printer_status()
@@ -679,17 +721,152 @@ def run_send_raw_hex():
 def run_read_response():
     try_read(label="Manual read")
 
-#GUI SETUP STARTS HERE
+def save_mac_address():
+    global mac_address
+    if mac_address_var is None:
+        return
+    candidate = mac_address_var.get().strip()
+    if not candidate:
+        messagebox.showwarning("Missing MAC", "Please enter a printer MAC address.")
+        return
+    settings["mac_address"] = candidate
+    save_settings(settings)
+    mac_address = candidate
+    log_diagnostics(f"Saved MAC address: {candidate}")
 
+def run_printer_info_command(name, payload, timeout_s=0.5, max_bytes=1024):
+    log_diagnostics(f"{name}: starting")
+    if not send_bytes(payload, label=name):
+        return
+    response = try_read(max_bytes=max_bytes, timeout_s=timeout_s, label=f"{name} response")
+    log_command_response(name, payload, response)
+
+# Curated probe list only: avoid brute-force commands that could lock up the printer.
+DISCOVER_PROBES = [
+    ("Initialize (ESC @)", b"\x1b\x40", 0.3, 256),
+    ("Status", b"\x1e\x47\x03", 0.5, 1024),
+    ("Serial Number", b"\x1d\x67\x39", 0.5, 1024),
+    ("Product Info", b"\x1d\x67\x69", 0.5, 1024),
+    ("Feed 3 lines (ESC d 03)", b"\x1b\x64\x03", 0.3, 256),
+    ("Line feed", b"\x0a", 0.3, 256),
+]
+
+discover_stop_event = threading.Event()
+discover_thread = None
+
+def run_discover_sequence():
+    log_diagnostics("Discover: starting curated probe list")
+    for name, payload, timeout_s, max_bytes in DISCOVER_PROBES:
+        if discover_stop_event.is_set():
+            log_diagnostics("Discover: stopped by user")
+            break
+        log_diagnostics(f"Discover: probe {name}")
+        if not send_bytes(payload, label=f"Discover {name}"):
+            continue
+        sleep(0.1)
+        response = try_read(max_bytes=max_bytes, timeout_s=timeout_s, label=f"Discover {name} response")
+        log_command_response(f"Discover {name}", payload, response)
+    log_diagnostics("Discover: complete")
+    root.after(0, lambda: _set_discover_buttons(running=False))
+
+def _set_discover_buttons(running):
+    if running:
+        discoverButton.config(state="disabled")
+        stopDiscoverButton.config(state="normal")
+    else:
+        discoverButton.config(state="normal")
+        stopDiscoverButton.config(state="disabled")
+
+def start_discover():
+    global discover_thread
+    if discover_thread and discover_thread.is_alive():
+        log_diagnostics("Discover: already running")
+        return
+    if not (printer.connected and printer.socket):
+        if not messagebox.askyesno("Not connected", "Connect to the printer before running Discover?"):
+            return
+        on_connect_click()
+        discover_stop_event.clear()
+        discover_thread = threading.Thread(target=_wait_for_connect_then_discover, daemon=True)
+        discover_thread.start()
+        return
+    discover_stop_event.clear()
+    _set_discover_buttons(running=True)
+    discover_thread = threading.Thread(target=run_discover_sequence, daemon=True)
+    discover_thread.start()
+
+def _wait_for_connect_then_discover(timeout_s=8.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if discover_stop_event.is_set():
+            root.after(0, lambda: _set_discover_buttons(running=False))
+            return
+        if printer.connected and printer.socket:
+            root.after(0, lambda: _set_discover_buttons(running=True))
+            run_discover_sequence()
+            return
+        sleep(0.1)
+    log_diagnostics("Discover: connection timed out")
+    root.after(0, lambda: _set_discover_buttons(running=False))
+
+def stop_discover():
+    discover_stop_event.set()
+    log_diagnostics("Discover: stop requested")
+
+#GUI SETUP STARTS HERE
 root = tk.Tk()
-frame = Frame(root)
-frame.pack()
 
 #Setting up window properties
 root.title("CTP500 Printer Control")
 root.configure() #Sets background color of the window. We will tweak this later to be able to select from printer colors and patterns
-root.minsize(520, 600) #Sets min size of the window
-root.geometry("520x600") #Changes original rendering position of the window
+root.minsize(640, 700) #Sets min size of the window
+root.geometry("720x850") #Changes original rendering position of the window
+
+main_container = Frame(root)
+main_container.pack(fill="both", expand=True)
+
+canvas = tk.Canvas(main_container, borderwidth=0)
+scrollbar_y = tk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
+scrollbar_x = tk.Scrollbar(main_container, orient="horizontal", command=canvas.xview)
+canvas.configure(yscrollcommand=scrollbar_y.set, xscrollcommand=scrollbar_x.set)
+scrollbar_y.pack(side="right", fill="y")
+scrollbar_x.pack(side="bottom", fill="x")
+canvas.pack(side="left", fill="both", expand=True)
+
+content_frame = Frame(canvas)
+content_window = canvas.create_window((0, 0), window=content_frame, anchor="nw")
+
+def _update_horizontal_scrollbar():
+    bbox = canvas.bbox("all")
+    if not bbox:
+        return
+    content_width = bbox[2] - bbox[0]
+    canvas_width = canvas.winfo_width()
+    if content_width <= canvas_width:
+        if scrollbar_x.winfo_ismapped():
+            scrollbar_x.pack_forget()
+        canvas.configure(xscrollcommand=None)
+    else:
+        if not scrollbar_x.winfo_ismapped():
+            scrollbar_x.pack(side="bottom", fill="x")
+        canvas.configure(xscrollcommand=scrollbar_x.set)
+
+def _on_frame_configure(event):
+    canvas.configure(scrollregion=canvas.bbox("all"))
+    _update_horizontal_scrollbar()
+
+def _on_canvas_configure(event):
+    canvas.itemconfig(content_window, width=event.width)
+    _update_horizontal_scrollbar()
+
+def _on_mousewheel(event):
+    canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+content_frame.bind("<Configure>", _on_frame_configure)
+canvas.bind("<Configure>", _on_canvas_configure)
+canvas.bind_all("<MouseWheel>", _on_mousewheel)
+canvas.bind_all("<Button-4>", lambda event: canvas.yview_scroll(-1, "units"))
+canvas.bind_all("<Button-5>", lambda event: canvas.yview_scroll(1, "units"))
 
 #Status + debug controls
 statusVar = tk.StringVar(value="Disconnected")
@@ -705,65 +882,60 @@ def on_connect_click():
         if printer.is_connecting or printer.connected:
             return
         printer.is_connecting = True
+    target_mac = get_current_mac_address()
+    if not target_mac:
+        messagebox.showwarning("Missing MAC", "Please enter a printer MAC address.")
+        with printer._lock:
+            printer.is_connecting = False
+        return
     update_status("Connecting...")
     connectButton.config(state="disabled")
-    worker.enqueue(run_connect)
+    worker.enqueue(run_connect, target_mac)
 
-#BLUETOOTH TOOLS SECTION STARTS HERE
-bluetoothFrame = Frame(root,
-                       borderwidth=1,
-                       padx=5,
-                       pady=5)
+#CONNECTION SECTION STARTS HERE
+connectionFrame = tk.LabelFrame(content_frame, text="Connection", padx=10, pady=10)
+connectionFrame.columnconfigure(1, weight=1)
 
-bluetoothLabel = Label(bluetoothFrame, text = "Bluetooth tools")
-bluetoothLabel.pack(fill="x")
+mac_address_var = tk.StringVar(value=mac_address)
+macLabel = Label(connectionFrame, text="Printer MAC Address")
+macLabel.grid(row=0, column=0, sticky="w")
+macEntry = tk.Entry(connectionFrame, textvariable=mac_address_var)
+macEntry.grid(row=0, column=1, sticky="ew", padx=(5, 5))
+macSaveButton = Button(connectionFrame, text="Save", command=save_mac_address)
+macSaveButton.grid(row=0, column=2, sticky="e")
 
-#Setting up connection button
 connectButton = tk.Button(
-    bluetoothFrame,
-    text = "Connect",
+    connectionFrame,
+    text="Connect",
     command=on_connect_click,
-    padx = 15,
-    pady = 15
+    padx=10,
+    pady=10
 )
-connectButton.pack(
-    side="left",
-    expand=1
-)
+connectButton.grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
-#Setting up disconnection button
 disconnectButton = tk.Button(
-    bluetoothFrame,
-    text = "Disconnect",
+    connectionFrame,
+    text="Disconnect",
     command=lambda: worker.enqueue(run_disconnect),
-    padx = 15,
-    pady = 15
-).pack(
-    side="left",
-    expand=1
+    padx=10,
+    pady=10
 )
+disconnectButton.grid(row=1, column=1, sticky="ew", padx=(5, 5), pady=(8, 0))
 
-bluetoothFrame.pack() #Rendering bluetoothFrame
+statusLabelTitle = Label(connectionFrame, text="Status:")
+statusLabelTitle.grid(row=2, column=0, sticky="w", pady=(8, 0))
+statusLabelValue = Label(connectionFrame, textvariable=statusVar, anchor="w")
+statusLabelValue.grid(row=2, column=1, columnspan=2, sticky="ew", pady=(8, 0))
 
-debugFrame = Frame(root, padx=5, pady=5)
-debugCheckbox = tk.Checkbutton(
-    debugFrame,
-    text="Debug mode (log bytes/chunks)",
-    variable=debugModeVar
-)
-debugCheckbox.pack(side="left")
-debugFrame.pack(fill="x")
+connectionFrame.pack(fill="x", padx=10, pady=5)
+#CONNECTION SECTION ENDS HERE
 
-statusFrame = Frame(root, padx=5, pady=5)
-statusLabelTitle = Label(statusFrame, text="Status:")
-statusLabelTitle.pack(side="left")
-statusLabelValue = Label(statusFrame, textvariable=statusVar, anchor="w")
-statusLabelValue.pack(side="left", fill="x", expand=True)
-statusFrame.pack(fill="x")
-#BLUETOOTH TOOLS SECTION ENDS HERE
+#PRINTING SECTION STARTS HERE
+printingFrame = tk.LabelFrame(content_frame, text="Printing", padx=10, pady=10)
+printingFrame.pack(fill="both", expand=True, padx=10, pady=5)
 
 #TEXT TOOLS SECTION STARTS HERE
-textFrame = Frame(root)
+textFrame = Frame(printingFrame)
 radioButtonsFrame = Frame(textFrame)
 
 #Creating our list of justification options
@@ -805,7 +977,7 @@ printTextButton.pack(fill="x", pady=(5, 0))
 
 #IMAGE TOOLS SECTION STARTS HERE
 #Creating a frame for the image selection area
-imageFrame = Frame(root)
+imageFrame = Frame(printingFrame)
 imageLabel = Label(imageFrame, text="Image tools").pack(fill="x", pady=(0,5))
 
 #Creating a canvas to display the image selection
@@ -841,9 +1013,37 @@ imageFrame.pack(fill="both", expand=True, padx=10, pady=5)
 #IMAGE TOOLS SECTION ENDS HERE
 
 #DIAGNOSTICS SECTION STARTS HERE
-diagnosticsFrame = Frame(root, padx=5, pady=5, borderwidth=1)
-diagnosticsLabel = Label(diagnosticsFrame, text="Diagnostics")
-diagnosticsLabel.pack(fill="x")
+diagnostics_visible = tk.BooleanVar(value=False)
+
+def toggle_diagnostics():
+    if diagnostics_visible.get():
+        diagnosticsFrame.pack_forget()
+        diagnostics_visible.set(False)
+        diagnosticsToggleButton.config(text="Show Diagnostics")
+    else:
+        diagnosticsFrame.pack(fill="both", expand=True, padx=10, pady=5)
+        diagnostics_visible.set(True)
+        diagnosticsToggleButton.config(text="Hide Diagnostics")
+
+diagnosticsToggleFrame = Frame(content_frame)
+diagnosticsToggleButton = Button(
+    diagnosticsToggleFrame,
+    text="Show Diagnostics",
+    command=toggle_diagnostics
+)
+diagnosticsToggleButton.pack(side="left")
+diagnosticsToggleFrame.pack(fill="x", padx=10, pady=(0, 5))
+
+diagnosticsFrame = tk.LabelFrame(content_frame, text="Diagnostics", padx=10, pady=10)
+
+debugFrame = Frame(diagnosticsFrame, padx=5, pady=5)
+debugCheckbox = tk.Checkbutton(
+    debugFrame,
+    text="Debug mode (log bytes/chunks)",
+    variable=debugModeVar
+)
+debugCheckbox.pack(side="left")
+debugFrame.pack(fill="x", pady=(0, 5))
 
 diag_use_esc_star_var = tk.IntVar(value=1)
 diag_use_gsv0_var = tk.IntVar(value=0)
@@ -866,6 +1066,43 @@ diagReadButton = Button(diagButtonFrame,
 diagReadButton.pack(side="left", expand=True, fill="x", padx=(5, 0))
 diagButtonFrame.pack(fill="x", pady=(5, 5))
 
+printerInfoFrame = tk.LabelFrame(diagnosticsFrame, text="Printer Info", padx=5, pady=5)
+printerStatusButton = Button(
+    printerInfoFrame,
+    text="Get Printer Status",
+    command=lambda: worker.enqueue(run_printer_info_command, "Printer Status", b"\x1e\x47\x03")
+)
+printerStatusButton.pack(side="left", expand=True, fill="x")
+printerSerialButton = Button(
+    printerInfoFrame,
+    text="Get Serial Number",
+    command=lambda: worker.enqueue(run_printer_info_command, "Serial Number", b"\x1d\x67\x39")
+)
+printerSerialButton.pack(side="left", expand=True, fill="x", padx=(5, 0))
+printerProductButton = Button(
+    printerInfoFrame,
+    text="Get Product Info",
+    command=lambda: worker.enqueue(run_printer_info_command, "Product Info", b"\x1d\x67\x69")
+)
+printerProductButton.pack(side="left", expand=True, fill="x", padx=(5, 0))
+printerInfoFrame.pack(fill="x", pady=(0, 5))
+
+discoverFrame = Frame(diagnosticsFrame)
+discoverButton = Button(
+    discoverFrame,
+    text="Discover",
+    command=start_discover
+)
+discoverButton.pack(side="left", expand=True, fill="x")
+stopDiscoverButton = Button(
+    discoverFrame,
+    text="Stop Discover",
+    command=stop_discover,
+    state="disabled"
+)
+stopDiscoverButton.pack(side="left", expand=True, fill="x", padx=(5, 0))
+discoverFrame.pack(fill="x", pady=(0, 5))
+
 diagOptionsFrame = Frame(diagnosticsFrame)
 tk.Checkbutton(diagOptionsFrame, text="Use ESC * image mode", variable=diag_use_esc_star_var).grid(row=0, column=0, sticky="w")
 tk.Checkbutton(diagOptionsFrame, text="Use GS v 0 raster mode", variable=diag_use_gsv0_var).grid(row=1, column=0, sticky="w")
@@ -885,10 +1122,10 @@ diagRawFrame.pack(fill="x", pady=(0, 5))
 
 diagnostics_log_widget = scrolledtext.ScrolledText(diagnosticsFrame, height=8, width=60, state="disabled")
 diagnostics_log_widget.pack(fill="both", expand=True)
-diagnosticsFrame.pack(fill="both", expand=True, padx=10, pady=5)
 #DIAGNOSTICS SECTION ENDS HERE
 
 def on_closing(): #Cleanup operations when closing the window
+    discover_stop_event.set()
     printer.disconnect() #Disconnecting the printer
     worker.shutdown()
     root.destroy() #Flushing the UI

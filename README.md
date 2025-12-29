@@ -5,6 +5,13 @@
 The Diagnostics panel provides a guided test sequence and raw command tools to verify
 Bluetooth communication and printing responsiveness for the CTP500TL ("Mini Printer-DC20").
 
+### Diagnostics and Discover controls
+* Use **Show Diagnostics** to reveal the Diagnostics panel (hidden by default).
+* **Printer MAC Address** is editable in the Connection section; click **Save** to persist it.
+* **Printer Info** buttons send Status, Serial Number, and Product Info commands and log responses.
+* **Discover** runs a curated, safe probe list and logs any bytes returned by the printer.
+  Click **Stop Discover** to cancel.
+
 ### How to run diagnostics
 1. Launch the app and connect to the printer with **Connect**.
    - The diagnostics sequence runs automatically after a successful connection.
