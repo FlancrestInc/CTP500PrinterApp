@@ -39,55 +39,80 @@ class PrinterConnect: #Starting a PrinterConnect class to keep track of connecti
     def __init__(self):
         self.socket = None #Starting a disconnect socket
         self.connected = False #Setting socket status to False/disconnected
+        # Lock protects connect/disconnect so we don't race the Bluetooth stack.
+        self._lock = threading.Lock()
+        self.is_connecting = False #Guard against repeated clicks/parallel connection attempts
+
+    def _close_socket(self):
+        # Defensive cleanup: EBUSY can happen if the OS still sees a half-open RFCOMM socket.
+        try:
+            if self.socket:
+                try:
+                    self.socket.shutdown(socket.SHUT_RDWR)
+                except Exception:
+                    pass
+                try:
+                    self.socket.close()
+                except Exception:
+                    pass
+        finally:
+            self.socket = None
+            self.connected = False
 
     def connect(self, mac_address): #Setting up a connection function
-        if self.connected: #Checking to see if the printer is already connected
-            print("Already connected") #Warning user
-            return True #Switching PrinterConnect socket status
+        with self._lock:
+            if self.connected: #Checking to see if the printer is already connected
+                print("Already connected") #Warning user
+                return True #Switching PrinterConnect socket status
 
-        try: #Starting all the things to do to establish a connection
-            self.socket = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM) #Setting up the Bluetooth socket with RFCOMM protocol
-            # Timeout protects against the OS or driver hanging indefinitely.
-            # The CTP500TL can silently stall if a link is flaky, so we cap every blocking call.
-            self.socket.settimeout(3)
-            self.socket.connect((mac_address, 1)) #Connection instruction with address and port to use
+            if self.socket:
+                # Ensure any stale socket is closed before a new attempt.
+                self._close_socket()
 
-            self.connected = True #Switching connection status for tracking
-            print("Connection established")
+            for attempt in range(3):
+                try: #Starting all the things to do to establish a connection
+                    self.socket = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM) #Setting up the Bluetooth socket with RFCOMM protocol
+                    # Timeout protects against the OS or driver hanging indefinitely.
+                    # The CTP500TL can silently stall if a link is flaky, so we cap every blocking call.
+                    self.socket.settimeout(3.0)
+                    self.socket.connect((mac_address, 1)) #Connection instruction with address and port to use
 
-            return True #Returning status
+                    self.connected = True #Switching connection status for tracking
+                    print("Connection established")
 
-        except Exception as e: #Exception handling in case something goes wrong
-            print(f'Connection error: {e}')
-            if self.socket: #If the socket connection is present:
-                self.socket.close() #Closing the connection
-                self.socket = None #Clearing the socket references
-            return False #Returning status
+                    return True #Returning status
+
+                except OSError as e:
+                    if e.errno == 16 and attempt < 2:
+                        # BlueZ can return EBUSY when RFCOMM is still closing; brief backoff helps.
+                        print("Connection busy, retrying...")
+                        self._close_socket()
+                        sleep(0.3)
+                        continue
+                    print(f'Connection error: {e}')
+                    self._close_socket()
+                    return False
+                except Exception as e: #Exception handling in case something goes wrong
+                    print(f'Connection error: {e}')
+                    self._close_socket() #Closing the connection
+                    return False #Returning status
 
     def disconnect(self): #Function to disconnect the socket
-        if not self.connected or not self.socket: #First a status check to see if already disconnected
-            print("Not connected") #Communication to user
-            return #Calling it a day
+        with self._lock:
+            if not self.socket: #First a status check to see if already disconnected
+                self.connected = False
+                print("Not connected") #Communication to user
+                return #Calling it a day
 
-        try:
-            print("Disconnecting printer")
-            print("Releasing Bluetooth comm resources")
-            self.socket.shutdown(socket.SHUT_RDWR) #Releasing comms resources
+            try:
+                print("Disconnecting printer")
+                print("Releasing Bluetooth comm resources")
+                self._close_socket()
+                print("Disconnected")
 
-            print("Cutting connection")
-            self.socket.close()
-
-            print("Clearing socket references")
-            self.socket = None #Clearing socket refs
-            self.connected = False #Switching connection status tracking
-            print("Disconnected")
-
-        except Exception as e:
-            print(f'Disconnection error: {e}') #Exception warning
-            if self.socket: #In case of connection shutdown failure, we close anyway
-                self.socket.close() #Closing socket
-                self.socket = None #Clearing the socket
-            self.connected = False #Setting socket status to false
+            except Exception as e:
+                print(f'Disconnection error: {e}') #Exception warning
+                self._close_socket() #Setting socket status to false
 
 
     def get_printer_status(self):
@@ -98,7 +123,7 @@ class PrinterConnect: #Starting a PrinterConnect class to keep track of connecti
             self.socket.send(b"\x1e\x47\x03") #Hex code for status request
             ready, _, _ = select.select([self.socket], [], [], 0.5)
             if ready:
-                return self.socket.recv(38) #Returning status request content
+                return self.socket.recv(1024) #Returning status request content
         except socket.timeout:
             pass
         except Exception as e:
@@ -319,9 +344,19 @@ def build_gsv0_raster(im, invert=False):
     return buf
 
 def run_diagnostics_sequence():
+    needs_connect = False
     try:
         log_diagnostics("Diagnostics: starting test sequence")
         if not (printer.connected and printer.socket):
+            with printer._lock:
+                connecting = printer.is_connecting
+            if connecting:
+                log_diagnostics("Step A: connection already in progress")
+                return
+            with printer._lock:
+                printer.is_connecting = True
+                needs_connect = True
+            root.after(0, lambda: connectButton.config(state="disabled"))
             log_diagnostics("Step A: connecting...")
             if not printer.connect(mac_address):
                 log_diagnostics("Step A: connection failed")
@@ -369,6 +404,11 @@ def run_diagnostics_sequence():
         log_diagnostics("Diagnostics: sequence complete")
     except Exception:
         log_diagnostics("Diagnostics failed:\n" + traceback.format_exc())
+    finally:
+        if needs_connect:
+            with printer._lock:
+                printer.is_connecting = False
+            root.after(0, lambda: connectButton.config(state="normal"))
 #DIAGNOSTICS UTILITIES END HERE
 
 #IMAGE DATA STORAGE STARTS HERE
@@ -602,15 +642,20 @@ def run_print_job(image, job_name, debug_enabled):
         update_status(f"{job_name} failed: {e}")
 
 def run_connect():
-    update_status("Connecting...")
-    if printer.connect(mac_address):
-        update_status("Connected")
-        print("Getting printer status (best effort)")
-        status = printer.get_printer_status()
-        print(f'Printer status: {status}')
-        run_diagnostics_sequence()
-    else:
-        update_status("Connection failed")
+    try:
+        update_status("Connecting...")
+        if printer.connect(mac_address):
+            update_status("Connected")
+            print("Getting printer status (best effort)")
+            status = printer.get_printer_status()
+            print(f'Printer status: {status}')
+            run_diagnostics_sequence()
+        else:
+            update_status("Connection failed")
+    finally:
+        with printer._lock:
+            printer.is_connecting = False
+        root.after(0, lambda: connectButton.config(state="normal"))
 
 def run_disconnect():
     update_status("Disconnecting...")
@@ -655,6 +700,15 @@ def update_status(message):
 
 worker = BluetoothWorker(update_status)
 
+def on_connect_click():
+    with printer._lock:
+        if printer.is_connecting or printer.connected:
+            return
+        printer.is_connecting = True
+    update_status("Connecting...")
+    connectButton.config(state="disabled")
+    worker.enqueue(run_connect)
+
 #BLUETOOTH TOOLS SECTION STARTS HERE
 bluetoothFrame = Frame(root,
                        borderwidth=1,
@@ -668,10 +722,11 @@ bluetoothLabel.pack(fill="x")
 connectButton = tk.Button(
     bluetoothFrame,
     text = "Connect",
-    command=lambda: worker.enqueue(run_connect),
+    command=on_connect_click,
     padx = 15,
     pady = 15
-).pack(
+)
+connectButton.pack(
     side="left",
     expand=1
 )
