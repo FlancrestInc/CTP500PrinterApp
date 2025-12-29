@@ -15,6 +15,7 @@ import queue
 import threading
 import time
 import select
+import traceback
 
 #Tkinter imports
 import tkinter as tk
@@ -48,7 +49,7 @@ class PrinterConnect: #Starting a PrinterConnect class to keep track of connecti
             self.socket = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM) #Setting up the Bluetooth socket with RFCOMM protocol
             # Timeout protects against the OS or driver hanging indefinitely.
             # The CTP500TL can silently stall if a link is flaky, so we cap every blocking call.
-            self.socket.settimeout(5)
+            self.socket.settimeout(3)
             self.socket.connect((mac_address, 1)) #Connection instruction with address and port to use
 
             self.connected = True #Switching connection status for tracking
@@ -179,6 +180,196 @@ class BluetoothWorker:
             finally:
                 self.queue.task_done()
 #DEBUG/WORKER UTILITIES END HERE
+
+#DIAGNOSTICS UTILITIES START HERE
+diagnostics_log_widget = None
+
+def format_hex_snippet(data, max_len=32):
+    return format_hex(data[:max_len])
+
+def log_diagnostics(message):
+    timestamp = time.strftime("%H:%M:%S")
+    line = f"[{timestamp}] {message}\n"
+    if diagnostics_log_widget:
+        diagnostics_log_widget.after(0, lambda: _append_diag_log(line))
+    else:
+        print(line.strip())
+
+def _append_diag_log(line):
+    diagnostics_log_widget.configure(state="normal")
+    diagnostics_log_widget.insert(tk.END, line)
+    diagnostics_log_widget.see(tk.END)
+    diagnostics_log_widget.configure(state="disabled")
+
+def send_bytes(data, label="Data"):
+    if not (printer.connected and printer.socket):
+        log_diagnostics("Send failed: not connected")
+        return False
+
+    chunked = bool(diag_chunked_var.get())
+    try:
+        chunk_size = int(diag_chunk_size_var.get() or 512)
+    except ValueError:
+        chunk_size = 512
+    try:
+        delay_ms = float(diag_chunk_delay_var.get() or 10)
+    except ValueError:
+        delay_ms = 10
+    delay_s = max(delay_ms, 0) / 1000.0
+    total = len(data)
+    if total == 0:
+        log_diagnostics(f"{label}: no data to send")
+        return True
+
+    log_diagnostics(f"{label}: sending {total} bytes, chunked={chunked}, first32={format_hex_snippet(data)}")
+    try:
+        if not chunked:
+            printer.socket.send(data)
+            return True
+
+        offset = 0
+        while offset < total:
+            chunk = data[offset:offset + chunk_size]
+            printer.socket.send(chunk)
+            log_diagnostics(f"{label}: chunk {offset}-{offset + len(chunk)} ({len(chunk)} bytes), delay={delay_ms:.1f}ms")
+            offset += len(chunk)
+            if delay_s:
+                sleep(delay_s)
+        return True
+    except Exception:
+        log_diagnostics("Send failed:\n" + traceback.format_exc())
+        return False
+
+def try_read(max_bytes=1024, timeout_s=0.3, label="Read"):
+    if not (printer.connected and printer.socket):
+        log_diagnostics("Read failed: not connected")
+        return b""
+    try:
+        ready, _, _ = select.select([printer.socket], [], [], timeout_s)
+        if not ready:
+            log_diagnostics(f"{label}: no data within {timeout_s:.1f}s")
+            return b""
+        data = printer.socket.recv(max_bytes)
+        if data:
+            log_diagnostics(f"{label}: received {len(data)} bytes: {format_hex(data)}")
+        else:
+            log_diagnostics(f"{label}: no data received")
+        return data
+    except socket.timeout:
+        log_diagnostics(f"{label}: recv timed out after {timeout_s:.1f}s")
+    except Exception:
+        log_diagnostics(f"{label} failed:\n" + traceback.format_exc())
+    return b""
+
+def build_checkerboard_image(size=16):
+    img = PIL.Image.new("1", (size, size), 1)
+    draw = PIL.ImageDraw.Draw(img)
+    block = 4
+    for y in range(0, size, block):
+        for x in range(0, size, block):
+            if ((x // block) + (y // block)) % 2 == 0:
+                draw.rectangle((x, y, x + block - 1, y + block - 1), fill=0)
+    return img
+
+def pack_esc_star_rows(im):
+    if im.mode != "1":
+        im = im.convert("1")
+    width = im.size[0]
+    height = im.size[1]
+    pixels = im.load()
+    rows = []
+    for row in range(0, height, 8):
+        row_bytes = bytearray()
+        for x in range(width):
+            byte = 0
+            for bit in range(8):
+                y = row + bit
+                if y < height:
+                    bit_val = 1 if pixels[x, y] == 0 else 0
+                else:
+                    bit_val = 0
+                byte |= (bit_val << (7 - bit))
+            row_bytes.append(byte)
+        rows.append(bytes(row_bytes))
+    return rows
+
+def build_gsv0_raster(im, invert=False):
+    if im.width > printerWidth:
+        height = int(im.height * (printerWidth / im.width))
+        im = im.resize((printerWidth, height))
+    if im.width < printerWidth:
+        padded_image = PIL.Image.new("1", (printerWidth, im.height), 1)
+        padded_image.paste(im)
+        im = padded_image
+    if im.mode != '1':
+        im = im.convert('1')
+    if im.size[0] % 8:
+        im2 = PIL.Image.new('1', (im.size[0] + 8 - im.size[0] % 8, im.size[1]), 'white')
+        im2.paste(im, (0, 0))
+        im = im2
+    if invert:
+        im = PIL.ImageOps.invert(im.convert('L')).convert('1')
+
+    buf = b''.join((bytearray(b'\x1d\x76\x30\x00'),
+                    struct.pack('2B', int(im.size[0] / 8 % 256),
+                                int(im.size[0] / 8 / 256)),
+                    struct.pack('2B', int(im.size[1] % 256),
+                                int(im.size[1] / 256)),
+                    im.tobytes()))
+    return buf
+
+def run_diagnostics_sequence():
+    try:
+        log_diagnostics("Diagnostics: starting test sequence")
+        if not (printer.connected and printer.socket):
+            log_diagnostics("Step A: connecting...")
+            if not printer.connect(mac_address):
+                log_diagnostics("Step A: connection failed")
+                return
+            log_diagnostics("Step A: connected")
+        else:
+            log_diagnostics("Step A: already connected")
+
+        log_diagnostics("Step B: initialize (ESC @)")
+        send_bytes(b"\x1b\x40", label="Init")
+        try_read(label="Init response")
+
+        log_diagnostics("Step C: feed 3 lines (ESC d 03)")
+        send_bytes(b"\x1b\x64\x03", label="Feed")
+        try_read(label="Feed response")
+
+        log_diagnostics("Step D: plain text print")
+        payload = b"TEST PRINT 1\nTEST PRINT 2\n\n"
+        payload += b"\x1b\x64\x03"
+        send_bytes(payload, label="Text test")
+        try_read(label="Text response")
+
+        log_diagnostics("Step E: checkerboard image test")
+        base_image = build_checkerboard_image(16)
+        invert_bits = bool(diag_invert_var.get())
+
+        if diag_use_esc_star_var.get():
+            log_diagnostics("Step E1: ESC * image mode")
+            esc_image = base_image
+            if invert_bits:
+                esc_image = PIL.ImageOps.invert(esc_image.convert("L")).convert("1")
+            rows = pack_esc_star_rows(esc_image)
+            for row_bytes in rows:
+                header = b"\x1b\x2a\x00" + struct.pack("2B", len(row_bytes) % 256, len(row_bytes) // 256)
+                send_bytes(header + row_bytes, label="ESC * row")
+                send_bytes(b"\n", label="ESC * newline")
+            try_read(label="ESC * response")
+
+        if diag_use_gsv0_var.get():
+            log_diagnostics("Step E2: GS v 0 raster mode")
+            raster = build_gsv0_raster(base_image, invert=invert_bits)
+            send_bytes(raster, label="GS v0 raster")
+            try_read(label="GS v0 response")
+
+        log_diagnostics("Diagnostics: sequence complete")
+    except Exception:
+        log_diagnostics("Diagnostics failed:\n" + traceback.format_exc())
+#DIAGNOSTICS UTILITIES END HERE
 
 #IMAGE DATA STORAGE STARTS HERE
 current_image = None #Variable to store full resolution image
@@ -417,6 +608,7 @@ def run_connect():
         print("Getting printer status (best effort)")
         status = printer.get_printer_status()
         print(f'Printer status: {status}')
+        run_diagnostics_sequence()
     else:
         update_status("Connection failed")
 
@@ -424,6 +616,23 @@ def run_disconnect():
     update_status("Disconnecting...")
     printer.disconnect()
     update_status("Disconnected")
+
+def run_send_raw_hex():
+    raw = diag_raw_hex_var.get().strip()
+    if not raw:
+        log_diagnostics("Raw hex: no data provided")
+        return
+    try:
+        cleaned = raw.replace(" ", "").replace("\n", "").replace("\t", "")
+        data = binascii.unhexlify(cleaned)
+    except Exception:
+        log_diagnostics("Raw hex parse failed:\n" + traceback.format_exc())
+        return
+    log_diagnostics(f"Raw hex send: {raw}")
+    send_bytes(data, label="Raw hex")
+
+def run_read_response():
+    try_read(label="Manual read")
 
 #GUI SETUP STARTS HERE
 
@@ -575,6 +784,54 @@ printTestButton = Button(imageFrame,
 printTestButton.pack(fill="x", pady=(5, 0))
 imageFrame.pack(fill="both", expand=True, padx=10, pady=5)
 #IMAGE TOOLS SECTION ENDS HERE
+
+#DIAGNOSTICS SECTION STARTS HERE
+diagnosticsFrame = Frame(root, padx=5, pady=5, borderwidth=1)
+diagnosticsLabel = Label(diagnosticsFrame, text="Diagnostics")
+diagnosticsLabel.pack(fill="x")
+
+diag_use_esc_star_var = tk.IntVar(value=1)
+diag_use_gsv0_var = tk.IntVar(value=0)
+diag_invert_var = tk.IntVar(value=0)
+diag_chunked_var = tk.IntVar(value=1)
+diag_chunk_size_var = tk.StringVar(value="512")
+diag_chunk_delay_var = tk.StringVar(value="10")
+diag_raw_hex_var = tk.StringVar(value="")
+
+diagButtonFrame = Frame(diagnosticsFrame)
+diagRunButton = Button(diagButtonFrame,
+                       text="Run Test Sequence",
+                       padx=10, pady=8,
+                       command=lambda: worker.enqueue(run_diagnostics_sequence))
+diagRunButton.pack(side="left", expand=True, fill="x")
+diagReadButton = Button(diagButtonFrame,
+                        text="Read Response",
+                        padx=10, pady=8,
+                        command=lambda: worker.enqueue(run_read_response))
+diagReadButton.pack(side="left", expand=True, fill="x", padx=(5, 0))
+diagButtonFrame.pack(fill="x", pady=(5, 5))
+
+diagOptionsFrame = Frame(diagnosticsFrame)
+tk.Checkbutton(diagOptionsFrame, text="Use ESC * image mode", variable=diag_use_esc_star_var).grid(row=0, column=0, sticky="w")
+tk.Checkbutton(diagOptionsFrame, text="Use GS v 0 raster mode", variable=diag_use_gsv0_var).grid(row=1, column=0, sticky="w")
+tk.Checkbutton(diagOptionsFrame, text="Invert image bits", variable=diag_invert_var).grid(row=2, column=0, sticky="w")
+tk.Checkbutton(diagOptionsFrame, text="Chunked writes", variable=diag_chunked_var).grid(row=3, column=0, sticky="w")
+Label(diagOptionsFrame, text="Chunk size").grid(row=3, column=1, sticky="e", padx=(10, 2))
+tk.Entry(diagOptionsFrame, textvariable=diag_chunk_size_var, width=8).grid(row=3, column=2, sticky="w")
+Label(diagOptionsFrame, text="Inter-chunk delay (ms)").grid(row=4, column=1, sticky="e", padx=(10, 2))
+tk.Entry(diagOptionsFrame, textvariable=diag_chunk_delay_var, width=8).grid(row=4, column=2, sticky="w")
+diagOptionsFrame.pack(fill="x", pady=(0, 5))
+
+diagRawFrame = Frame(diagnosticsFrame)
+Label(diagRawFrame, text="Send Raw Hex").pack(side="left")
+tk.Entry(diagRawFrame, textvariable=diag_raw_hex_var, width=25).pack(side="left", padx=(5, 5))
+Button(diagRawFrame, text="Send", command=lambda: worker.enqueue(run_send_raw_hex)).pack(side="left")
+diagRawFrame.pack(fill="x", pady=(0, 5))
+
+diagnostics_log_widget = scrolledtext.ScrolledText(diagnosticsFrame, height=8, width=60, state="disabled")
+diagnostics_log_widget.pack(fill="both", expand=True)
+diagnosticsFrame.pack(fill="both", expand=True, padx=10, pady=5)
+#DIAGNOSTICS SECTION ENDS HERE
 
 def on_closing(): #Cleanup operations when closing the window
     printer.disconnect() #Disconnecting the printer
